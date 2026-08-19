@@ -109,16 +109,7 @@ prosodic_probe = joblib.load(PROSODIC_PROBE_PATH)
 
 print("Model and probes loaded successfully.")
 
-# ---------- Inference + explainability ----------
-def score_audio(filepath):
-    waveform = load_and_window(filepath)
-    mel = extract_mel_spectrogram(waveform)
-    prosodic = normalize_prosodic(extract_prosodic_features_fast(waveform))
-    mel_t = torch.from_numpy(mel).unsqueeze(0).unsqueeze(0).float().to(device)
-    pros_t = torch.from_numpy(prosodic).unsqueeze(0).float().to(device)
-    with torch.no_grad():
-        return torch.sigmoid(v3_model(mel_t, pros_t)).item()
-
+# ---------- Inference + explainability (ONE shared forward+backward pass) ----------
 def get_risk_level(prob_fake):
     if prob_fake < 0.3:
         return "Low Risk", "green", "Consistent with genuine human speech."
@@ -127,68 +118,76 @@ def get_risk_level(prob_fake):
     else:
         return "High Risk", "red", "Consistent with AI-generated or synthetic speech."
 
-_captured = {}
-def _acoustic_hook(module, inp, out):
-    _captured["acoustic"] = out.detach().flatten(1)
-def _prosodic_hook(module, inp, out):
-    _, h_n = out
-    _captured["prosodic"] = h_n[-1].detach()
+def run_full_analysis(filepath):
+    """Single forward+backward pass. Captures acoustic embedding, prosodic embedding,
+    and Grad-CAM activations/gradients all at once via simultaneous hooks — this replaces
+    what used to be 4 separate model runs (huge win for CPU time and peak memory on a
+    512MB instance)."""
+    captured = {}
+    def _acoustic_hook(module, inp, out):
+        captured["acoustic"] = out.detach().flatten(1)
+    def _prosodic_hook(module, inp, out):
+        _, h_n = out
+        captured["prosodic"] = h_n[-1].detach()
+    def _gradcam_fwd_hook(module, inp, out):
+        captured["gradcam_acts"] = out
+    def _gradcam_bwd_hook(module, grad_in, grad_out):
+        captured["gradcam_grads"] = grad_out[0]
 
-def get_score_breakdown(filepath):
     h1 = v3_model.resnet_backbone.register_forward_hook(_acoustic_hook)
     h2 = v3_model.gru.register_forward_hook(_prosodic_hook)
+    target_layer = v3_model.resnet_backbone[7]
+    h3 = target_layer.register_forward_hook(_gradcam_fwd_hook)
+    h4 = target_layer.register_full_backward_hook(_gradcam_bwd_hook)
+
     try:
-        prob_fake = score_audio(filepath)
-        ac_emb = _captured["acoustic"].cpu().numpy()[0]
-        pr_emb = _captured["prosodic"].cpu().numpy()[0]
+        waveform = load_and_window(filepath)
+        mel = extract_mel_spectrogram(waveform)
+        raw_prosodic = extract_prosodic_features_fast(waveform)
+        prosodic = normalize_prosodic(raw_prosodic)
+        mel_t = torch.from_numpy(mel).unsqueeze(0).unsqueeze(0).float().to(device)
+        pros_t = torch.from_numpy(prosodic).unsqueeze(0).float().to(device)
+
+        v3_model.zero_grad()
+        with torch.backends.cudnn.flags(enabled=False):
+            output = v3_model(mel_t, pros_t)
+            output.backward()
+
+        fused_prob = torch.sigmoid(output).item()
+        ac_emb = captured["acoustic"].cpu().numpy()[0]
+        pr_emb = captured["prosodic"].cpu().numpy()[0]
+        acts = captured["gradcam_acts"][0]
+        grads = captured["gradcam_grads"][0]
     finally:
-        h1.remove()
-        h2.remove()
+        h1.remove(); h2.remove(); h3.remove(); h4.remove()
+
     acoustic_prob = acoustic_probe.predict_proba(ac_emb.reshape(1, -1))[0][1]
     prosodic_prob = prosodic_probe.predict_proba(pr_emb.reshape(1, -1))[0][1]
-    return acoustic_prob, prosodic_prob, prob_fake
 
-def compute_gradcam(filepath):
-    v3_model.eval()
-    activations, gradients = {}, {}
-    def fwd_hook(module, inp, out):
-        activations["value"] = out
-    def bwd_hook(module, grad_in, grad_out):
-        gradients["value"] = grad_out[0]
-    target_layer = v3_model.resnet_backbone[7]
-    h1 = target_layer.register_forward_hook(fwd_hook)
-    h2 = target_layer.register_full_backward_hook(bwd_hook)
-
-    waveform = load_and_window(filepath)
-    mel = extract_mel_spectrogram(waveform)
-    prosodic = normalize_prosodic(extract_prosodic_features_fast(waveform))
-    mel_t = torch.from_numpy(mel).unsqueeze(0).unsqueeze(0).float().to(device)
-    pros_t = torch.from_numpy(prosodic).unsqueeze(0).float().to(device)
-
-    v3_model.zero_grad()
-    with torch.backends.cudnn.flags(enabled=False):
-        output = v3_model(mel_t, pros_t)
-        output.backward()
-    h1.remove()
-    h2.remove()
-
-    acts = activations["value"][0]
-    grads = gradients["value"][0]
     weights = grads.mean(dim=(1, 2))
     cam = torch.zeros(acts.shape[1:], dtype=torch.float32, device=device)
     for i, w in enumerate(weights):
         cam += w * acts[i]
     cam = torch.relu(cam).detach().cpu().numpy()
     cam = cam / (cam.max() + 1e-8)
-    return cam, mel, torch.sigmoid(output).item()
 
-def plot_gradcam(filepath):
+    return {
+        "fused_prob": fused_prob,
+        "acoustic_prob": float(acoustic_prob),
+        "prosodic_prob": float(prosodic_prob),
+        "cam": cam,
+        "mel": mel,
+        "raw_prosodic": raw_prosodic,
+    }
+
+def render_gradcam_image(cam, mel, prob_fake):
+    """Pure rendering — no model call. Takes the already-computed cam/mel from
+    run_full_analysis()."""
     from scipy.ndimage import zoom, gaussian_filter
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    cam, mel, prob_fake = compute_gradcam(filepath)
     SUPERSAMPLE = 4
     target_h, target_w = mel.shape[0] * SUPERSAMPLE, mel.shape[1] * SUPERSAMPLE
     zoom_factors = (target_h / cam.shape[0], target_w / cam.shape[1])
@@ -220,17 +219,17 @@ def describe_deviation(name, z, pos_word, neg_word):
     direction = pos_word if z > 0 else neg_word
     return f"{name} is {direction} than typical training values ({z:+.1f} SD)."
 
-def generate_explanation(filepath):
-    acoustic_prob, prosodic_prob, fused_prob = get_score_breakdown(filepath)
+def generate_explanation(analysis):
+    """Takes the dict already produced by run_full_analysis() — no recomputation."""
+    acoustic_prob, prosodic_prob, fused_prob = analysis["acoustic_prob"], analysis["prosodic_prob"], analysis["fused_prob"]
     tier, color, risk_desc = get_risk_level(fused_prob)
 
-    waveform = load_and_window(filepath)
-    raw_prosodic = extract_prosodic_features_fast(waveform)
+    raw_prosodic = analysis["raw_prosodic"]
     f0_z = (raw_prosodic[0].mean() - PROSODIC_STATS["f0_mean"]) / PROSODIC_STATS["f0_std"]
     centroid_z = (raw_prosodic[2].mean() - PROSODIC_STATS["centroid_mean"]) / PROSODIC_STATS["centroid_std"]
     rms_z = (raw_prosodic[1].mean() - PROSODIC_STATS["rms_mean"]) / PROSODIC_STATS["rms_std"]
 
-    cam, mel, _ = compute_gradcam(filepath)
+    cam, mel = analysis["cam"], analysis["mel"]
     freq_bins, time_bins = cam.shape
     freq_idx, time_idx = np.indices(cam.shape)
     total_weight = cam.sum() + 1e-8
@@ -264,36 +263,103 @@ def generate_explanation(filepath):
                  f"attribution concentrated in the top 20% of the spectrogram).")
     return "\n".join(lines)
 
-# ---------- API-facing function ----------
-def analyze_audio_api(audio_filepath):
-    """This is the function the Flutter app calls via the auto-generated Gradio API."""
+# ---------- Visual GUI (matches the Flutter app's amber/crimson design system) ----------
+RISK_COLORS = {"green": "#FFB020", "orange": "#FFB020", "red": "#E63950"}
+
+def format_risk_badge(verdict, risk_level, risk_color, prob_fake):
+    color = "#E63950" if verdict == "FAKE" else "#FFB020"
+    text_color = "#1A1206" if verdict != "FAKE" else "#FFF3E0"
+    verdict_label = "🧑 HUMAN VOICE" if verdict == "REAL" else "🤖 AI-GENERATED"
+    return f"""
+    <div style="background-color:{color}; color:{text_color}; padding:20px; border-radius:4px; text-align:center; font-family: 'Orbitron', sans-serif;">
+        <div style="font-size:26px; font-weight:600; letter-spacing:0.05em;">{verdict_label}</div>
+        <div style="font-size:13px; margin-top:8px; opacity:0.9; font-family: 'Sora', sans-serif; letter-spacing:0.04em;">{risk_level.upper()} — SPOOF PROBABILITY: {prob_fake*100:.1f}%</div>
+    </div>
+    """
+
+def format_breakdown_bars(acoustic_prob, prosodic_prob):
+    def bar(label, value):
+        pct = value * 100
+        color = "#E63950" if value > 0.5 else "#FFB020"
+        return f"""
+        <div style="margin-bottom:12px; font-family: 'Sora', sans-serif;">
+            <div style="display:flex; justify-content:space-between; font-size:12px; margin-bottom:4px; letter-spacing:0.04em; color:#D9CFC3;">
+                <span>{label.upper()}</span><span>{pct:.1f}%</span>
+            </div>
+            <div style="background:#241E18; overflow:hidden; height:14px;">
+                <div style="width:{pct}%; background:{color}; height:100%;"></div>
+            </div>
+        </div>
+        """
+    return f"""
+    <div style="padding:14px; background:#171310; border-left: 2px solid #FFB020;">
+        {bar("Acoustic (spectral) branch", acoustic_prob)}
+        {bar("Prosodic (pitch / rhythm / energy) branch", prosodic_prob)}
+    </div>
+    """
+
+def predict_full(audio_filepath):
     if audio_filepath is None:
-        return {"error": "No audio provided"}, None
+        empty_badge = "<div style='padding:18px; text-align:center; color:#6B6259; font-family: Sora, sans-serif;'>Record or upload a clip to begin.</div>"
+        return empty_badge, "", None, "", "", 0.0, "", 0.0, 0.0, ""
 
-    acoustic_prob, prosodic_prob, fused_prob = get_score_breakdown(audio_filepath)
+    import gc
+
+    analysis = run_full_analysis(audio_filepath)
+    fused_prob = analysis["fused_prob"]
     tier, color, risk_desc = get_risk_level(fused_prob)
-    explanation = generate_explanation(audio_filepath)
-    heatmap_img = plot_gradcam(audio_filepath)
+    explanation = generate_explanation(analysis)
+    heatmap_img = render_gradcam_image(analysis["cam"], analysis["mel"], fused_prob)
+    verdict = "REAL" if fused_prob < DEMO_THRESHOLD else "FAKE"
+    acoustic_prob, prosodic_prob = analysis["acoustic_prob"], analysis["prosodic_prob"]
 
-    result = {
-        "verdict": "REAL" if fused_prob < DEMO_THRESHOLD else "FAKE",
-        "prob_fake": round(float(fused_prob), 4),
-        "risk_level": tier,
-        "risk_color": color,
-        "risk_description": risk_desc,
-        "acoustic_prob_fake": round(float(acoustic_prob), 4),
-        "prosodic_prob_fake": round(float(prosodic_prob), 4),
-        "explanation": explanation,
-    }
-    return result, heatmap_img
+    badge_html = format_risk_badge(verdict, tier, color, fused_prob)
+    breakdown_html = format_breakdown_bars(acoustic_prob, prosodic_prob)
+    explanation_md = "### Explanation\n\n" + explanation.replace("\n", "\n\n")
 
-demo = gr.Interface(
-    fn=analyze_audio_api,
-    inputs=gr.Audio(sources=["microphone", "upload"], type="filepath", label="Voice sample"),
-    outputs=[gr.JSON(label="Analysis"), gr.Image(label="Grad-CAM Heatmap")],
-    title="SpeechFoxAI API",
-    description="Explainable audio deepfake detection — ResNet18 + GRU fusion. Called by the SpeechFoxAI Flutter app.",
-)
+    del analysis
+    gc.collect()
+
+    # Visible outputs (badge_html, breakdown_html, heatmap_img, explanation_md) for the browser GUI,
+    # PLUS plain hidden values (verdict, prob_fake, risk_level, acoustic_prob, prosodic_prob, explanation)
+    # for the Flutter app to read from the same API call — one computation serves both.
+    return (badge_html, breakdown_html, heatmap_img, explanation_md,
+            verdict, round(float(fused_prob), 4), tier, round(float(acoustic_prob), 4),
+            round(float(prosodic_prob), 4), explanation)
+
+with gr.Blocks(title="SpeechFoxAI — Explainable Audio Deepfake Detector") as demo:
+    gr.HTML("<link rel='stylesheet' href='https://fonts.googleapis.com/css2?family=Orbitron:wght@500;600&family=Sora:wght@400;500;600&display=swap'>")
+    gr.Markdown("# 🦊 SpeechFox<span style='color:#FFB020'>AI</span>")
+    gr.Markdown("### Explainable Audio Deepfake Detection\nRecord or upload a voice sample. The system analyzes both acoustic (spectral) and prosodic (pitch/rhythm/energy) patterns, and shows *why* it reached its verdict — not just the verdict itself.")
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            audio_input = gr.Audio(sources=["microphone", "upload"], type="filepath", label="Record or upload a voice sample")
+            analyze_btn = gr.Button("🔍 RUN DETECTION", variant="primary", size="lg")
+        with gr.Column(scale=1):
+            risk_badge = gr.HTML(label="Risk Level")
+            breakdown_html = gr.HTML(label="Acoustic vs. Prosodic Breakdown")
+
+    with gr.Row():
+        heatmap_output = gr.Image(label="Grad-CAM Spectrogram Heatmap", type="pil")
+        explanation_output = gr.Markdown(label="Explanation")
+
+    # Hidden fields — not shown in the browser UI, but present in the API response for Flutter
+    api_verdict = gr.Textbox(visible=False)
+    api_prob_fake = gr.Number(visible=False)
+    api_risk_level = gr.Textbox(visible=False)
+    api_acoustic_prob = gr.Number(visible=False)
+    api_prosodic_prob = gr.Number(visible=False)
+    api_explanation_raw = gr.Textbox(visible=False)
+
+    analyze_btn.click(
+        fn=predict_full,
+        inputs=audio_input,
+        outputs=[risk_badge, breakdown_html, heatmap_output, explanation_output,
+                  api_verdict, api_prob_fake, api_risk_level, api_acoustic_prob,
+                  api_prosodic_prob, api_explanation_raw],
+        api_name="analyze"
+    )
 
 if __name__ == "__main__":
     import os
