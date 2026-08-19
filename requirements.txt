@@ -1,0 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+librosa
+numpy
+scipy
+scikit-learn
+joblib
+gradio
+matplotlib
+pillow
+soundfile
