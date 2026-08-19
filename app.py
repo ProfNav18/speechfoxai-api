@@ -1,8 +1,13 @@
-# SpeechFoxAI — Hugging Face Spaces API backend
-# Loads the v3 model + pre-trained probes from local Space files (uploaded alongside this app.py)
-import os, io, base64
+# SpeechFoxAI — Render API backend
+# Loads the v3 model + pre-trained probes from files in this repo
+import os
+os.environ["NUMBA_DISABLE_JIT"] = "1"  # cuts librosa's heavy numba/LLVM import footprint — matters a lot on 512MB
+
+import io, base64
 import numpy as np
 import torch
+torch.set_num_threads(1)  # free tier gives a fraction of a CPU core; multithreading just adds overhead here
+
 import torch.nn as nn
 import torchvision.models as tv_models
 import librosa
@@ -80,7 +85,11 @@ class ResNet18GRUFusionTunable(nn.Module):
         return self.fusion(fused).squeeze(-1)
 
 # ---------- Load checkpoint + probes ----------
-v3_ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
+try:
+    v3_ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False, mmap=True)
+except TypeError:
+    # older torch versions don't support mmap= — fall back cleanly
+    v3_ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
 best_params = v3_ckpt["best_params"]
 PROSODIC_STATS = v3_ckpt["prosodic_stats"]
 
