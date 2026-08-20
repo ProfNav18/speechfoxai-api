@@ -123,6 +123,7 @@ def run_full_analysis(filepath):
     and Grad-CAM activations/gradients all at once via simultaneous hooks — this replaces
     what used to be 4 separate model runs (huge win for CPU time and peak memory on a
     512MB instance)."""
+    print(">>> [1/6] run_full_analysis started", flush=True)
     captured = {}
     def _acoustic_hook(module, inp, out):
         captured["acoustic"] = out.detach().flatten(1)
@@ -141,9 +142,11 @@ def run_full_analysis(filepath):
     h4 = target_layer.register_full_backward_hook(_gradcam_bwd_hook)
 
     try:
+        print(">>> [2/6] loading + preprocessing audio", flush=True)
         waveform = load_and_window(filepath)
         mel = extract_mel_spectrogram(waveform)
         raw_prosodic = extract_prosodic_features_fast(waveform)
+        print(">>> [3/6] audio preprocessing done, running model forward pass", flush=True)
         prosodic = normalize_prosodic(raw_prosodic)
         mel_t = torch.from_numpy(mel).unsqueeze(0).unsqueeze(0).float().to(device)
         pros_t = torch.from_numpy(prosodic).unsqueeze(0).float().to(device)
@@ -151,7 +154,9 @@ def run_full_analysis(filepath):
         v3_model.zero_grad()
         with torch.backends.cudnn.flags(enabled=False):
             output = v3_model(mel_t, pros_t)
+            print(">>> [4/6] forward pass done, running backward pass", flush=True)
             output.backward()
+        print(">>> [5/6] backward pass done", flush=True)
 
         fused_prob = torch.sigmoid(output).item()
         ac_emb = captured["acoustic"].cpu().numpy()[0]
@@ -170,6 +175,7 @@ def run_full_analysis(filepath):
         cam += w * acts[i]
     cam = torch.relu(cam).detach().cpu().numpy()
     cam = cam / (cam.max() + 1e-8)
+    print(">>> [6/6] run_full_analysis done", flush=True)
 
     return {
         "fused_prob": fused_prob,
@@ -299,6 +305,7 @@ def format_breakdown_bars(acoustic_prob, prosodic_prob):
     """
 
 def predict_full(audio_filepath):
+    print(f">>> predict_full called, audio_filepath={audio_filepath}", flush=True)
     if audio_filepath is None:
         empty_badge = "<div style='padding:18px; text-align:center; color:#6B6259; font-family: Sora, sans-serif;'>Record or upload a clip to begin.</div>"
         return empty_badge, "", None, "", "", 0.0, "", 0.0, 0.0, ""
